@@ -1,0 +1,301 @@
+// RSS Collector v2
+// Workflow ID: 1xBLqqGqTqBBntRS
+// URL: https://n8n.melikhov.biz/workflow/1xBLqqGqTqBBntRS
+//
+// Описание:
+//   Каждый час собирает RSS из 10 источников (AI/IT тематика),
+//   дедуплицирует через Supabase (24-часовое окно),
+//   классифицирует через GPT-4.1 (score 1-10),
+//   публикует топ-3 на источник (score >= 7) в Telegram-канал.
+//
+// Переменные окружения / секреты (хранятся в n8n Credentials):
+//   - SUPABASE_URL:        https://cfyfpifbjvldvscnyxtk.supabase.co
+//   - SUPABASE_KEY:        <service_role key — в параметрах нод Fetch Recent Published и Save to Supabase>
+//   - TELEGRAM_CHAT_ID:    -1003875206504
+//   - TELEGRAM_BOT:        @SaluteRomanBot (credential "Telegram account" в n8n)
+//   - OPENAI_CREDENTIAL:   "OpenAI" в n8n
+//
+// Архитектура нод:
+//
+//  [Every 60 Minutes]
+//       │
+//  [Sources Config]          ← Set-нода: список 10 RSS-источников
+//       │
+//  [Expand RSS Sources]      ← Code: сбрасывает буфер, разворачивает источники
+//       │
+//  [Loop RSS Sources]        ← splitInBatches: итерация по источникам
+//   ├─(each batch)→ [Fetch RSS] → [Append RSS Buffer] → (loop back)
+//   └─(done)──────→ [Collect RSS]
+//                       │
+//              [Fetch Recent Published]  ← HTTP GET /published_articles (Supabase, executeOnce)
+//                       │
+//              [Filter Unpublished]     ← Code: убирает дубли + статьи без контента
+//                       │
+//              [AI Classifier]          ← OpenAI gpt-4.1: score + title + lead + hashtags
+//                       │
+//              [Parse AI Response]      ← Code: парсит JSON из ответа AI
+//                       │
+//              [Top 3 Per Source]       ← Code: топ-3 по score для каждого источника
+//                       │
+//              [Format Message]         ← Code: форматирует текст поста (emoji + Markdown)
+//                       │
+//              [Post to Telegram]       ← splitInBatches: по одному посту
+//               └─(each batch)→ [Publish to Telegram] → [Save to Supabase] → [Wait 1 Second] → (loop back)
+//
+// Supabase таблица:
+//   CREATE TABLE published_articles (
+//     id          BIGSERIAL PRIMARY KEY,
+//     article_id  TEXT NOT NULL,
+//     published_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//   );
+//   INDEX: idx_published_articles_article_id
+//   INDEX: idx_published_articles_published_at
+//
+// RSS-источники:
+//   1. qudata.com            — https://qudata.com/en/news/rss.xml
+//   2. TechCrunch            — https://techcrunch.com/feed/
+//   3. Ars Technica          — https://feeds.arstechnica.com/arstechnica/technology-lab
+//   4. VentureBeat AI        — https://venturebeat.com/ai/feed/
+//   5. MIT Technology Review — https://www.technologyreview.com/feed/
+//   6. The Verge             — https://www.theverge.com/rss/index.xml
+//   7. Wired                 — https://www.wired.com/feed/rss
+//   8. AI News               — https://artificialintelligence-news.com/feed/
+//   9. ZDNET AI              — https://www.zdnet.com/topic/artificial-intelligence/rss.xml
+//  10. aifeed.dev            — https://aifeed.dev/feed.xml
+{
+  "id": "1xBLqqGqTqBBntRS",
+  "name": "RSS Collector v2",
+  "description": "Hourly RSS collector: dedupe, OpenAI scoring, Telegram publish for score >= 7.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "nodes": [
+    {
+      "id": "20966f4f-142b-4864-b6b5-80ab3d19bfa9",
+      "name": "Every 60 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [0, 272],
+      "parameters": {
+        "rule": { "interval": [{ "field": "hours" }] }
+      }
+    },
+    {
+      "id": "2adccab2-51ef-4c08-b3bb-ad8d1fa5b0ea",
+      "name": "Sources Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [224, 272],
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\"rssSources\":[{\"name\":\"qudata.com\",\"url\":\"https://qudata.com/en/news/rss.xml\"},{\"name\":\"TechCrunch\",\"url\":\"https://techcrunch.com/feed/\"},{\"name\":\"Ars Technica\",\"url\":\"https://feeds.arstechnica.com/arstechnica/technology-lab\"},{\"name\":\"VentureBeat AI\",\"url\":\"https://venturebeat.com/ai/feed/\"},{\"name\":\"MIT Technology Review\",\"url\":\"https://www.technologyreview.com/feed/\"},{\"name\":\"The Verge\",\"url\":\"https://www.theverge.com/rss/index.xml\"},{\"name\":\"Wired\",\"url\":\"https://www.wired.com/feed/rss\"},{\"name\":\"AI News\",\"url\":\"https://artificialintelligence-news.com/feed/\"},{\"name\":\"ZDNET AI\",\"url\":\"https://www.zdnet.com/topic/artificial-intelligence/rss.xml\"},{\"name\":\"aifeed.dev\",\"url\":\"https://aifeed.dev/feed.xml\"}]}",
+        "options": {}
+      }
+    },
+    {
+      "id": "d6474a49-5c82-4817-9eda-e0a8c001321e",
+      "name": "Expand RSS Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [448, 272],
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nstaticData.rss_buffer = [];\nconst config = $input.first().json;\nconst sources = config.rssSources || [];\nreturn sources.map((s) => ({ json: { ...s, sourceType: 'rss' } }));"
+      }
+    },
+    {
+      "id": "21257926-c2fa-4094-b61c-cbfcae82ae5c",
+      "name": "Loop RSS Sources",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [672, 272],
+      "parameters": { "options": {} }
+    },
+    {
+      "id": "3ae7d205-d9c7-44ce-be27-c1b7dbc3a6dc",
+      "name": "Fetch RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [896, 272],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "d2a5368e-e479-4574-a3ea-33dce9028624",
+      "name": "Append RSS Buffer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 336],
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!Array.isArray(staticData.rss_buffer)) staticData.rss_buffer = [];\nconst source = $('Loop RSS Sources').first()?.json || {};\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.error || j.errorMessage) continue;\n  if (!j.title && !j.link && !j.guid) continue;\n  staticData.rss_buffer.push({\n    ...j,\n    sourceName: source.name || j.sourceName || '',\n    sourceUrl: source.url || j.sourceUrl || '',\n  });\n}\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "120c08a7-ba7b-4a0d-90b0-736d0651124d",
+      "name": "Collect RSS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [896, 80],
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst buffered = staticData.rss_buffer || [];\nstaticData.rss_buffer = [];\nconst fromFetch = $('Fetch RSS')\n  .all()\n  .map((item) => item.json)\n  .filter((j) => j && !j.error && !j.errorMessage && (j.title || j.link || j.guid));\nconst merged = [...buffered, ...fromFetch];\nconst seen = new Set();\nconst out = [];\nfor (const j of merged) {\n  const id = j.guid || j.link || j.id;\n  if (!id || seen.has(id)) continue;\n  seen.add(id);\n  out.push({ json: j });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "60d1c8d1-bc2d-4763-b895-333ed160e59e",
+      "name": "Fetch Recent Published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [1120, 80],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://cfyfpifbjvldvscnyxtk.supabase.co/rest/v1/published_articles?select=article_id&published_at=gte.' + new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "{\"apikey\":\"<SUPABASE_SERVICE_ROLE_KEY>\",\"Authorization\":\"Bearer <SUPABASE_SERVICE_ROLE_KEY>\"}",
+        "options": {}
+      }
+    },
+    {
+      "id": "62858d8c-8b00-472c-b610-2f9e4ef503fc",
+      "name": "Filter Unpublished",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1344, 80],
+      "parameters": {
+        "jsCode": "const recentIds = new Set(\n  $input.all().map((item) => item.json.article_id).filter(id => id)\n);\nconst rssItems = $('Collect RSS').all();\nconst seen = new Set();\nconst out = [];\nfor (const item of rssItems) {\n  const j = item.json || {};\n  const id = j.guid || j.link || j.id;\n  if (!id || recentIds.has(id) || seen.has(id)) continue;\n  if (!j.title && !j.contentSnippet && !j.description && !j.content) continue;\n  seen.add(id);\n  out.push({\n    json: {\n      ...j,\n      itemId: id,\n      title: j.title || '',\n      contentSnippet:\n        j.contentSnippet ||\n        j['content:encodedSnippet'] ||\n        j.description ||\n        j.content ||\n        j['content:encoded'] ||\n        '',\n    },\n  });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "1d431de5-13dc-40fa-9732-774aca1601c8",
+      "name": "AI Classifier",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [1568, 80],
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "gpt-4.1" },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Ты — редактор Telegram-канала о технологиях и IT.\nТебе передаётся новость: заголовок и краткое содержание.\nОцени релевантность для IT/tech аудитории по шкале 1–10 (score).\nЕсли score >= 7: перепиши заголовок коротко и ёмко (до 10 слов). Напиши лид (2–3 предложения, нейтральный информационный тон, без воды). Подбери 3–5 хэштегов на русском.\nЕсли score < 7: заполни поля пустыми строками.\nВерни ТОЛЬКО валидный JSON без markdown-блоков:\n{\"score\": 8, \"title\": \"...\", \"lead\": \"...\", \"hashtags\": \"#тег1 #тег2 #тег3\"}"
+            },
+            {
+              "content": "={{ 'Заголовок: ' + ($json.title || '') + '\\n\\nСодержание: ' + ($json.contentSnippet || '') }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": { "textFormat": { "textOptions": {} } }
+      }
+    },
+    {
+      "id": "e95a21b5-3ac5-4b70-af88-320ef59aa912",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1792, 80],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const filterItems = $('Filter Unpublished').all();\nconst base = filterItems[$itemIndex]?.json || {};\nconst ai = $input.item.json;\nfunction pullText(data) {\n  if (typeof data === 'string') return data;\n  if (!data || typeof data !== 'object') return '';\n  if (typeof data.output === 'string') return data.output;\n  if (data.output && typeof data.output === 'object' && !Array.isArray(data.output)) {\n    if ('score' in data.output) return JSON.stringify(data.output);\n  }\n  if (Array.isArray(data.output) && data.output.length) {\n    const block = data.output[0];\n    if (typeof block === 'string') return block;\n    if (block?.text) return block.text;\n    if (Array.isArray(block?.content)) {\n      const part = block.content.find((p) => p?.text);\n      if (part?.text) return part.text;\n    }\n  }\n  if (typeof data.text === 'string') return data.text;\n  if (typeof data.message?.content === 'string') return data.message.content;\n  if ('score' in data) return JSON.stringify(data);\n  return '';\n}\nfunction toParsed(data) {\n  const empty = { score: 0, title: '', lead: '', hashtags: '' };\n  let candidate = data;\n  if (typeof candidate === 'string') {\n    try {\n      candidate = JSON.parse(candidate.replace(/```json\\s*|```/gi, '').trim());\n    } catch (e) {\n      return empty;\n    }\n  }\n  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return empty;\n  return {\n    score: Number(candidate.score ?? candidate.Score ?? 0) || 0,\n    title: String(candidate.title ?? ''),\n    lead: String(candidate.lead ?? ''),\n    hashtags: String(candidate.hashtags ?? ''),\n  };\n}\nconst parsed = toParsed(pullText(ai) || ai);\nreturn {\n  json: {\n    itemId: String(base.itemId || base.guid || base.link || ''),\n    title: parsed.title || String(base.title || ''),\n    lead: parsed.lead,\n    hashtags: parsed.hashtags,\n    score: parsed.score,\n    link: String(base.link || base.url || ''),\n    contentSnippet: String(base.contentSnippet || ''),\n    sourceType: String(base.sourceType || 'rss'),\n    sourceName: String(base.sourceName || ''),\n    sourceUrl: String(base.sourceUrl || ''),\n  },\n};"
+      }
+    },
+    {
+      "id": "753d4c4d-014f-40b6-8196-50408f690e5c",
+      "name": "Top 3 Per Source",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2016, 80],
+      "parameters": {
+        "jsCode": "const MIN_SCORE = 7;\nconst TOP_N = 3;\nconst scored = $input.all()\n  .map((item) => item.json)\n  .filter((j) => Number(j.score) >= MIN_SCORE);\nconst bySource = new Map();\nfor (const j of scored) {\n  const key = String(j.sourceUrl || j.sourceName || 'unknown');\n  if (!bySource.has(key)) bySource.set(key, []);\n  bySource.get(key).push(j);\n}\nconst out = [];\nfor (const list of bySource.values()) {\n  list.sort((a, b) => Number(b.score) - Number(a.score));\n  for (const j of list.slice(0, TOP_N)) {\n    out.push({ json: j });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "d302a493-904b-4b43-a70f-796401ae75c7",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 80],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $json;\nconst score = Number(d.score) || 0;\nconst emoji = score >= 9 ? '🔥' : score >= 7 ? '📰' : '📌';\nconst link = d.link || '';\nconst text =\n  emoji + ' ' + (d.title || '') + '\\n\\n' +\n  (d.lead || '') + '\\n\\n' +\n  '[Читать источник](' + link + ')\\n\\n' +\n  (d.hashtags || '');\nreturn {\n  json: {\n    itemId: String(d.itemId || ''),\n    title: String(d.title || ''),\n    lead: String(d.lead || ''),\n    hashtags: String(d.hashtags || ''),\n    score: Number(d.score) || 0,\n    link: String(d.link || ''),\n    contentSnippet: String(d.contentSnippet || ''),\n    sourceType: String(d.sourceType || 'rss'),\n    telegramText: text,\n  },\n};"
+      }
+    },
+    {
+      "id": "ec75b25c-7ddf-4f3b-aaa9-056c4ff3a707",
+      "name": "Post to Telegram",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [2464, 80],
+      "parameters": { "options": {} }
+    },
+    {
+      "id": "09d7d15a-c278-482c-9465-9f247981cc61",
+      "name": "Publish to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2688, 0],
+      "parameters": {
+        "chatId": "-1003875206504",
+        "text": "={{ $json.telegramText }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      }
+    },
+    {
+      "id": "6978d726-fb03-4a3b-a67e-3f6b113ddb52",
+      "name": "Save to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [2912, 0],
+      "alwaysOutputData": true,
+      "parameters": {
+        "method": "POST",
+        "url": "https://cfyfpifbjvldvscnyxtk.supabase.co/rest/v1/published_articles",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "{\"apikey\":\"<SUPABASE_SERVICE_ROLE_KEY>\",\"Authorization\":\"Bearer <SUPABASE_SERVICE_ROLE_KEY>\",\"Prefer\":\"return=minimal\"}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { article_id: $('Post to Telegram').item.json.itemId } }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "d9ebbe11-d1f5-41ec-9be7-83fd991a210b",
+      "name": "Wait 1 Second",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [3136, 80],
+      "parameters": { "amount": 1 }
+    }
+  ],
+  "connections": {
+    "Every 60 Minutes":    { "main": [[{ "node": "Sources Config",       "type": "main", "index": 0 }]] },
+    "Sources Config":      { "main": [[{ "node": "Expand RSS Sources",   "type": "main", "index": 0 }]] },
+    "Expand RSS Sources":  { "main": [[{ "node": "Loop RSS Sources",     "type": "main", "index": 0 }]] },
+    "Loop RSS Sources":    { "main": [[{ "node": "Collect RSS",          "type": "main", "index": 0 }],
+                                      [{ "node": "Fetch RSS",            "type": "main", "index": 0 }]] },
+    "Fetch RSS":           { "main": [[{ "node": "Append RSS Buffer",    "type": "main", "index": 0 }]] },
+    "Append RSS Buffer":   { "main": [[{ "node": "Loop RSS Sources",     "type": "main", "index": 0 }]] },
+    "Collect RSS":         { "main": [[{ "node": "Fetch Recent Published","type": "main", "index": 0 }]] },
+    "Fetch Recent Published": { "main": [[{ "node": "Filter Unpublished","type": "main", "index": 0 }]] },
+    "Filter Unpublished":  { "main": [[{ "node": "AI Classifier",        "type": "main", "index": 0 }]] },
+    "AI Classifier":       { "main": [[{ "node": "Parse AI Response",    "type": "main", "index": 0 }]] },
+    "Parse AI Response":   { "main": [[{ "node": "Top 3 Per Source",     "type": "main", "index": 0 }]] },
+    "Top 3 Per Source":    { "main": [[{ "node": "Format Message",       "type": "main", "index": 0 }]] },
+    "Format Message":      { "main": [[{ "node": "Post to Telegram",     "type": "main", "index": 0 }]] },
+    "Post to Telegram":    { "main": [[],
+                                      [{ "node": "Publish to Telegram",  "type": "main", "index": 0 }]] },
+    "Publish to Telegram": { "main": [[{ "node": "Save to Supabase",     "type": "main", "index": 0 }]] },
+    "Save to Supabase":    { "main": [[{ "node": "Wait 1 Second",        "type": "main", "index": 0 }]] },
+    "Wait 1 Second":       { "main": [[{ "node": "Post to Telegram",     "type": "main", "index": 0 }]] }
+  }
+}
